@@ -1,4 +1,4 @@
-from lib.MotorController import MotorController
+from MotorController import MotorController
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
