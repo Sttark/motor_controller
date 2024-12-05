@@ -69,7 +69,7 @@ def main():
     motor_x.home_to_mechanical('CW')
     motor_y.home_to_mechanical('CW')
 
-    print("Test update for Nathan and Cole")
+    print("Test update for Nathan and Cole and Nik")
 
     interactive_mode(motors)
 
