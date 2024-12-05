@@ -18,7 +18,7 @@ class MotorController:
                 acceleration=100, 
                 deceleration=100,
                 jog_velocity=100,
-                current_limit_amperes=4.0,
+                current_limit_amperes=0.5,
                 homing_current=1.0):
         
         self.port = port
