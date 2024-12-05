@@ -69,6 +69,8 @@ def main():
     motor_x.home_to_mechanical('CW')
     motor_y.home_to_mechanical('CW')
 
+    print("Motors homed to mechanical zero position.")
+
     interactive_mode(motors)
 
 if __name__ == "__main__":
