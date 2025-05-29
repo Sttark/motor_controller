@@ -2,12 +2,205 @@ import threading
 import time
 import minimalmodbus
 import serial
+import serial.tools.list_ports
+import glob
+import os
+import subprocess
+from config import MOTOR_CONTROLLER_USB
+from lib.EmailService import EmailService
 
 class MotorController:
     _lock = threading.RLock()  # Class-level lock for all instances
+    _max_retries = 10  # Maximum number of retries for communication
+
+    @classmethod
+    def list_usb_devices(cls):
+        """List all available USB serial devices."""
+        # Method 1: Using glob to find all ttyUSB devices
+        tty_devices = glob.glob('/dev/ttyUSB*')
+        
+        # Method 2: Using pyserial to get detailed port info
+        detailed_ports = []
+        for port in serial.tools.list_ports.comports():
+            if 'USB' in port.device:
+                port_info = f"{port.device} - {port.description}"
+                if port.vid is not None and port.pid is not None:
+                    port_info += f" (VID:{port.vid:04x} PID:{port.pid:04x})"
+                detailed_ports.append(port_info)
+        
+        print("==== Available USB devices ====")
+        if tty_devices:
+            print("Simple device listing:")
+            for dev in tty_devices:
+                print(f"  {dev} - Exists: {os.path.exists(dev)}")
+        else:
+            print("No /dev/ttyUSB* devices found")
+            
+        print("\nDetailed port information:")
+        if detailed_ports:
+            for port_info in detailed_ports:
+                print(f"  {port_info}")
+        else:
+            print("  No USB serial ports detected by pyserial")
+        print("===============================")
+        
+        return tty_devices
+
+    @classmethod
+    def force_reset_connection(cls, device_path=None, motor_number=None):
+        # Get all available devices before reset for comparison
+        before_devices = cls.list_usb_devices()
+        
+        reset_message = f"Performing system-level USB reset for motor {motor_number or 'unknown'}"
+        print(reset_message)
+        
+        # If no specific device provided, try to find motor controller devices
+        if device_path is None:
+            # Try to find any ttyUSB device
+            usb_devices = glob.glob('/dev/ttyUSB*')
+            print(f"Found {usb_devices} USB devices")
+            if usb_devices:
+                device_path = usb_devices[0]
+                print(f"No device specified, using first available: {device_path}")
+        
+        success = False
+        
+        if device_path and os.path.exists(device_path):
+            try:
+                # Find the USB bus and device ID
+                result = subprocess.run(
+                    f"udevadm info -q path -n {device_path}",
+                    shell=True, capture_output=True, text=True
+                )
+                if result.returncode != 0:
+                    print(f"Failed to get device info: {result.stderr}")
+                    return False
+                
+                device_path = result.stdout.strip()
+                # Extract USB bus path - we want to get to the USB device level
+                # Example path: /devices/pci0000:00/0000:00:14.0/usb1/1-1/1-1.2/1-1.2:1.0/ttyUSB0
+                # We want: /devices/pci0000:00/0000:00:14.0/usb1/1-1/1-1.2
+                path_parts = device_path.split('/')
+                usb_path = None
+                
+                # Find the first component that looks like a USB device
+                for i, part in enumerate(path_parts):
+                    if ':' in part and part.endswith(':1.0'):  # This is usually the interface
+                        usb_path = '/'.join(path_parts[:i])
+                        break
+                
+                if not usb_path:
+                    # Fallback: just use the first 5 components which usually gets us to the device
+                    usb_path = '/'.join(path_parts[0:5])
+                
+                print(f"USB device path: {usb_path}")
+                
+                # Try different reset methods in order of increasing severity
+                
+                # Method 1: Use authorized attribute if available
+                if os.path.exists(f"/sys/{usb_path}/authorized"):
+                    print(f"Resetting USB device using authorized attribute")
+                    try:
+                        # Disable then re-enable the port
+                        with open(f"/sys/{usb_path}/authorized", 'w') as f:
+                            f.write('0')  # Disable
+                        time.sleep(1)
+                        with open(f"/sys/{usb_path}/authorized", 'w') as f:
+                            f.write('1')  # Re-enable
+                        print(f"USB device at {usb_path} has been power cycled")
+                        success = True
+                    except Exception as e:
+                        print(f"Failed to reset using authorized attribute: {e}")
+                
+                # Method 2: Try using the reset_device attribute if available
+                if not success and os.path.exists(f"/sys/{usb_path}/reset_device"):
+                    print(f"Resetting USB device using reset_device attribute")
+                    try:
+                        with open(f"/sys/{usb_path}/reset_device", 'w') as f:
+                            f.write('1')  # Trigger reset
+                        print(f"USB device at {usb_path} has been reset")
+                        success = True
+                    except Exception as e:
+                        print(f"Failed to reset using reset_device attribute: {e}")
+                
+                # Method 3: Use the usb_modeswitch utility if available
+                if not success:
+                    try:
+                        # Check if usb_modeswitch is available
+                        result = subprocess.run(
+                            "which usb_modeswitch",
+                            shell=True, capture_output=True, text=True
+                        )
+                        if result.returncode == 0:
+                            # Extract bus and device number from path
+                            # This is complex and may need adjustment for your system
+                            print(f"Attempting reset with usb_modeswitch")
+                            result = subprocess.run(
+                                f"usb_modeswitch -R -v {MOTOR_CONTROLLER_USB['vendor_id']} -p {MOTOR_CONTROLLER_USB['product_id']}",
+                                shell=True, capture_output=True, text=True
+                            )
+                            if result.returncode == 0:
+                                print(f"USB device reset with usb_modeswitch")
+                                success = True
+                            else:
+                                print(f"usb_modeswitch failed: {result.stderr}")
+                    except Exception as e:
+                        print(f"Failed to reset using usb_modeswitch: {e}")
+                
+                # Wait for device to re-enumerate
+                time.sleep(3)
+                
+            except Exception as e:
+                print(f"Failed during USB device reset: {e}")
+        else:
+            print(f"Device path {device_path} not found or not specified")
+        
+        # Get devices after reset and compare
+        after_devices = cls.list_usb_devices()
+        
+        # Log changes in devices
+        added = [d for d in after_devices if d not in before_devices]
+        removed = [d for d in before_devices if d not in after_devices]
+        
+        if added:
+            print(f"New devices after reset: {added}")
+        if removed:
+            print(f"Devices removed after reset: {removed}")
+        
+        # Try to reconnect a few times after reset
+        if success:
+            print("USB reset completed, attempting to reconnect...")
+        else:
+            print("USB reset methods failed, still attempting to reconnect...")
+        
+        # Send email notification about the reset with all collected logs
+        try:
+            email = EmailService(log_file_path="output.log")
+            email.send_notification(
+                subject=f"Motor Controller USB Reset - Motor {motor_number or 'unknown'}",
+                message=f"""
+                Motor controller communication failure detected.
+                Performing system-level USB reset at {time.strftime('%Y-%m-%d %H:%M:%S')}.
+
+                Device path: {device_path or 'unknown'}
+                Motor number: {motor_number or 'unknown'}
+                Reset success: {success}
+
+                Devices added: {added if added else 'None'}
+                Devices removed: {removed if removed else 'None'}
+
+                This email was sent automatically by the motor control system.
+                """,
+                include_log_lines=True
+            )
+        except Exception as e:
+            print(f"Failed to send email notification: {e}")
+        
+        # Return the success status of the reset operation
+        return success
 
     def __init__(self, 
-                port='/dev/ttyUSB0', 
+                port=None, 
                 slave_address=1, 
                 baudrate=115200, 
                 pulses_per_unit=None, 
@@ -17,27 +210,119 @@ class MotorController:
                 velocity=450, 
                 acceleration=100, 
                 deceleration=100,
-                jog_velocity=100,
+                jog_velocity=300,
                 current_limit_amperes=0.5,
-                homing_current=1.0):
+                homing_current=0.5):
         
-        self.port = port
+        # If port is not provided, find it automatically
+        self.port = port if port is not None else self.find_port()
+        if self.port is None:
+            raise ValueError("Motor controller port not found")
+            
         self.slave_address = slave_address
+        self.baudrate = baudrate
         self.home_position = home_position #TODO consider when we need to home to the upper limit
         self.is_homed = False
         
-        self._setup_drive(port, slave_address, baudrate)
+        self._setup_drive(self.port, slave_address, baudrate)
         self._setup_motor_parameters(pulses_per_unit, upper_limit_units, lower_limit_units, velocity, acceleration, deceleration, jog_velocity, current_limit_amperes, homing_current)
+
+    @classmethod
+    def find_port(cls):
+        """Find the serial port for the motor controller."""
+        for port in serial.tools.list_ports.comports():
+            if port.vid == MOTOR_CONTROLLER_USB['vendor_id'] and port.pid == MOTOR_CONTROLLER_USB['product_id']:
+                return port.device
+        return None
 
     # Setup methods (private)
     def _setup_drive(self, port, slave_address, baudrate):
-        self.drive = minimalmodbus.Instrument(port, slave_address)
+        """Setup the drive with continuous retry until successful."""
+        attempt = 1
+        while attempt <= self._max_retries:
+            try:
+                # Check if port exists before attempting connection
+                if port is None:
+                    # Try to find a valid port
+                    port = self.find_port()
+                    if port is None:
+                        print(f"No valid motor controller port found on attempt {attempt}")
+                        # List available USB devices to help diagnose the issue
+                        self.list_usb_devices()
+                        attempt += 1
+                        time.sleep(1)
+                        continue
+
+                self.drive = minimalmodbus.Instrument(port, slave_address)
+                self.drive.serial.baudrate = baudrate
+                self.drive.serial.bytesize = 8
+                self.drive.serial.parity = serial.PARITY_NONE
+                self.drive.serial.stopbits = 1
+                self.drive.serial.timeout = 1
+                
+                # Test communication
+                self._read_register(0x2203)
+                print(f"Successfully connected to motor {slave_address}")
+                return  # Success
+            except Exception as e:
+                print(f"Connection attempt {attempt} failed: {str(e)}")
+                print(f"Retrying connection to motor {slave_address} in 1 second...")
+                # List available USB devices when connection fails
+                self.list_usb_devices()
+                attempt += 1
+                time.sleep(1)
+                try:
+                    self.drive.serial.close()
+                except:
+                    pass
+                
+                # Always find port dynamically on failure
+                # This ensures we don't keep trying a disconnected port
+                port = self.find_port()
+                if port:
+                    print(f"Found motor controller on port: {port}")
+                    self.port = port  # Update the instance port
+                else:
+                    print(f"No motor controller found - will retry in 1 second")
+                    port = None  # Reset port to force new discovery
+                    
+        # All normal attempts failed, try nuclear option as last resort
+        print(f"All {self._max_retries} connection attempts failed. Attempting system-level USB reset...")
+        self.force_reset_connection(device_path=port, motor_number=slave_address)
         
-        self.drive.serial.baudrate = baudrate
-        self.drive.serial.bytesize = 8
-        self.drive.serial.parity = serial.PARITY_NONE
-        self.drive.serial.stopbits = 1
-        self.drive.serial.timeout = 1
+        # After reset, try one final connection attempt
+        time.sleep(2)  # Give system time to re-enumerate USB devices
+        final_port = self.find_port()
+        if final_port:
+            print(f"Found motor controller on port {final_port} after reset. Making final connection attempt...")
+            try:
+                self.drive = minimalmodbus.Instrument(final_port, slave_address)
+                self.drive.serial.baudrate = baudrate
+                self.drive.serial.bytesize = 8
+                self.drive.serial.parity = serial.PARITY_NONE
+                self.drive.serial.stopbits = 1
+                self.drive.serial.timeout = 1
+                
+                # Test communication
+                self._read_register(0x2203)
+                print(f"Successfully connected to motor {slave_address} after system reset")
+                self.port = final_port  # Update the instance port
+                return  # Success after reset
+            except Exception as e:
+                print(f"Final connection attempt after reset failed: {str(e)}")
+        else:
+            print("No motor controller found even after system reset")
+            
+        # If we reach here, even the nuclear option failed
+        raise ConnectionError(f"Failed to connect to motor {slave_address} after {self._max_retries} attempts and system reset")
+
+    def _reconnect(self):
+        """Attempt to reconnect to the drive."""
+        try:
+            self.drive.serial.close()
+        except:
+            pass
+        self._setup_drive(self.port, self.slave_address, self.baudrate)
 
     def _setup_motor_parameters(self, pulses_per_unit, upper_limit_units, lower_limit_units, velocity, acceleration, deceleration, jog_velocity, current_limit_amperes, homing_current):
         self.pulses_per_unit = pulses_per_unit
@@ -55,12 +340,34 @@ class MotorController:
 
     # Register read/write methods (private)
     def _write_register(self, address, value, functioncode=6):
+        """Write to register with continuous retry until successful."""
         with self._lock:
-            self.drive.write_register(address, value, functioncode=functioncode)
+            attempt = 1
+            while True:
+                try:
+                    self.drive.write_register(address, value, functioncode=functioncode)
+                    time.sleep(0.01)
+                    return
+                except Exception as e:
+                    print(f"Write attempt {attempt} failed: {str(e)}")
+                    print(f"Retrying write to motor {self.slave_address} in 1 second...")
+                    attempt += 1
+                    self._reconnect()
 
     def _read_register(self, address, functioncode=3):
+        """Read from register with continuous retry until successful."""
         with self._lock:
-            return self.drive.read_register(address, functioncode=functioncode)
+            attempt = 1
+            while True:
+                try:
+                    response = self.drive.read_register(address, functioncode=functioncode)
+                    time.sleep(0.01)
+                    return response
+                except Exception as e:
+                    print(f"Read attempt {attempt} failed: {str(e)}")
+                    print(f"Retrying read from motor {self.slave_address} in 1 second...")
+                    attempt += 1
+                    self._reconnect()
 
     # Private methods for internal operations
     def _check_alarm(self):
@@ -101,7 +408,7 @@ class MotorController:
             raise RuntimeError(f"Failed to read current position: {e}")
 
     def _jog_motor_towards_home(self):
-        command = 0x4002 
+        command = 0x4001 
         try:
             self._write_register(0x1801, command)
         except Exception as e:
