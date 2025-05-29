@@ -11,7 +11,7 @@ from lib.EmailService import EmailService
 
 class MotorController:
     _lock = threading.RLock()  # Class-level lock for all instances
-    _max_retries = 10  # Maximum number of retries for communication
+    _max_retries = 5  # Maximum number of retries for communication
 
     @classmethod
     def list_usb_devices(cls):
@@ -62,6 +62,9 @@ class MotorController:
             if usb_devices:
                 device_path = usb_devices[0]
                 print(f"No device specified, using first available: {device_path}")
+            else:
+                print("WARNING: No USB devices found - cannot attempt any reset methods")
+                return False
         
         success = False
         
@@ -77,75 +80,33 @@ class MotorController:
                     return False
                 
                 device_path = result.stdout.strip()
-                # Extract USB bus path - we want to get to the USB device level
-                # Example path: /devices/pci0000:00/0000:00:14.0/usb1/1-1/1-1.2/1-1.2:1.0/ttyUSB0
-                # We want: /devices/pci0000:00/0000:00:14.0/usb1/1-1/1-1.2
-                path_parts = device_path.split('/')
-                usb_path = None
+                print(f"USB device path: {device_path}")
                 
-                # Find the first component that looks like a USB device
-                for i, part in enumerate(path_parts):
-                    if ':' in part and part.endswith(':1.0'):  # This is usually the interface
-                        usb_path = '/'.join(path_parts[:i])
-                        break
-                
-                if not usb_path:
-                    # Fallback: just use the first 5 components which usually gets us to the device
-                    usb_path = '/'.join(path_parts[0:5])
-                
-                print(f"USB device path: {usb_path}")
-                
-                # Try different reset methods in order of increasing severity
-                
-                # Method 1: Use authorized attribute if available
-                if os.path.exists(f"/sys/{usb_path}/authorized"):
-                    print(f"Resetting USB device using authorized attribute")
-                    try:
-                        # Disable then re-enable the port
-                        with open(f"/sys/{usb_path}/authorized", 'w') as f:
-                            f.write('0')  # Disable
-                        time.sleep(1)
-                        with open(f"/sys/{usb_path}/authorized", 'w') as f:
-                            f.write('1')  # Re-enable
-                        print(f"USB device at {usb_path} has been power cycled")
-                        success = True
-                    except Exception as e:
-                        print(f"Failed to reset using authorized attribute: {e}")
-                
-                # Method 2: Try using the reset_device attribute if available
-                if not success and os.path.exists(f"/sys/{usb_path}/reset_device"):
-                    print(f"Resetting USB device using reset_device attribute")
-                    try:
-                        with open(f"/sys/{usb_path}/reset_device", 'w') as f:
-                            f.write('1')  # Trigger reset
-                        print(f"USB device at {usb_path} has been reset")
-                        success = True
-                    except Exception as e:
-                        print(f"Failed to reset using reset_device attribute: {e}")
-                
-                # Method 3: Use the usb_modeswitch utility if available
-                if not success:
-                    try:
-                        # Check if usb_modeswitch is available
+                # Only use usb_modeswitch method since the other methods don't work
+                print("Attempting USB reset using usb_modeswitch")
+                try:
+                    # Check if usb_modeswitch is available
+                    result = subprocess.run(
+                        "which usb_modeswitch",
+                        shell=True, capture_output=True, text=True
+                    )
+                    if result.returncode == 0:
+                        # Extract bus and device number from path
+                        # This is complex and may need adjustment for your system
+                        print(f"Attempting reset with usb_modeswitch")
                         result = subprocess.run(
-                            "which usb_modeswitch",
+                            f"usb_modeswitch -R -v {MOTOR_CONTROLLER_USB['vendor_id']} -p {MOTOR_CONTROLLER_USB['product_id']}",
                             shell=True, capture_output=True, text=True
                         )
                         if result.returncode == 0:
-                            # Extract bus and device number from path
-                            # This is complex and may need adjustment for your system
-                            print(f"Attempting reset with usb_modeswitch")
-                            result = subprocess.run(
-                                f"usb_modeswitch -R -v {MOTOR_CONTROLLER_USB['vendor_id']} -p {MOTOR_CONTROLLER_USB['product_id']}",
-                                shell=True, capture_output=True, text=True
-                            )
-                            if result.returncode == 0:
-                                print(f"USB device reset with usb_modeswitch")
-                                success = True
-                            else:
-                                print(f"usb_modeswitch failed: {result.stderr}")
-                    except Exception as e:
-                        print(f"Failed to reset using usb_modeswitch: {e}")
+                            print(f"USB device reset with usb_modeswitch")
+                            success = True
+                        else:
+                            print(f"usb_modeswitch failed: {result.stderr}")
+                    else:
+                        print("USB reset skipped: usb_modeswitch not found")
+                except Exception as e:
+                    print(f"Failed to reset using usb_modeswitch: {e}")
                 
                 # Wait for device to re-enumerate
                 time.sleep(3)
@@ -153,7 +114,7 @@ class MotorController:
             except Exception as e:
                 print(f"Failed during USB device reset: {e}")
         else:
-            print(f"Device path {device_path} not found or not specified")
+            print(f"Device path {device_path} not found or not specified - cannot attempt any reset methods")
         
         # Get devices after reset and compare
         after_devices = cls.list_usb_devices()
@@ -248,7 +209,13 @@ class MotorController:
                     if port is None:
                         print(f"No valid motor controller port found on attempt {attempt}")
                         # List available USB devices to help diagnose the issue
-                        self.list_usb_devices()
+                        usb_devices = self.list_usb_devices()
+                        
+                        # Check if any USB devices exist at all
+                        if not glob.glob('/dev/ttyUSB*') and attempt == self._max_retries:
+                            print("No USB devices detected - aborting connection attempts")
+                            raise ConnectionError(f"Failed to connect to motor {slave_address} - no USB devices detected")
+                            
                         attempt += 1
                         time.sleep(1)
                         continue
@@ -286,7 +253,13 @@ class MotorController:
                     print(f"No motor controller found - will retry in 1 second")
                     port = None  # Reset port to force new discovery
                     
-        # All normal attempts failed, try nuclear option as last resort
+        # All normal attempts failed, check for USB devices before trying reset
+        usb_devices = glob.glob('/dev/ttyUSB*')
+        if not usb_devices:
+            print(f"No USB devices detected - skipping system-level reset and further connection attempts")
+            raise ConnectionError(f"Failed to connect to motor {slave_address} - no USB devices detected")
+            
+        # Try nuclear option as last resort
         print(f"All {self._max_retries} connection attempts failed. Attempting system-level USB reset...")
         self.force_reset_connection(device_path=port, motor_number=slave_address)
         
