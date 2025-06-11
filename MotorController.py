@@ -528,6 +528,9 @@ class MotorController:
         register_value = int(current_limit_amperes * 10)
         self._write_register(0x0191, register_value)
 
+    def save_parameters_to_eeprom(self):
+        self._write_register(0x1801, 0x2211)
+
     def set_homing_direction(self, homing_direction):
         homing_direction = homing_direction.upper()
         if homing_direction not in ['CW', 'CCW']:
