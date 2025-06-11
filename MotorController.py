@@ -8,6 +8,10 @@ import os
 import subprocess
 from config import MOTOR_CONTROLLER_USB
 from lib.EmailService import EmailService
+import logging
+from gpio_utils import reset_usb_connection
+
+logger = logging.getLogger(__name__)
 
 class MotorController:
     _lock = threading.RLock()  # Class-level lock for all instances
@@ -173,7 +177,8 @@ class MotorController:
                 deceleration=100,
                 jog_velocity=300,
                 current_limit_amperes=0.5,
-                homing_current=0.5):
+                homing_current=0.5,
+                reset_pin=12):
         
         # If port is not provided, find it automatically
         self.port = port if port is not None else self.find_port()
@@ -184,6 +189,7 @@ class MotorController:
         self.baudrate = baudrate
         self.home_position = home_position #TODO consider when we need to home to the upper limit
         self.is_homed = False
+        self.reset_pin = reset_pin  # Store reset pin
         
         self._setup_drive(self.port, slave_address, baudrate)
         self._setup_motor_parameters(pulses_per_unit, upper_limit_units, lower_limit_units, velocity, acceleration, deceleration, jog_velocity, current_limit_amperes, homing_current)
@@ -191,9 +197,24 @@ class MotorController:
     @classmethod
     def find_port(cls):
         """Find the serial port for the motor controller."""
+        logger.info(f"Searching for motor controller with VID:{MOTOR_CONTROLLER_USB['vendor_id']:04x} PID:{MOTOR_CONTROLLER_USB['product_id']:04x}")
+        
+        # List all available ports for debugging
+        available_ports = []
         for port in serial.tools.list_ports.comports():
-            if port.vid == MOTOR_CONTROLLER_USB['vendor_id'] and port.pid == MOTOR_CONTROLLER_USB['product_id']:
-                return port.device
+            port_info = f"{port.device} - {port.description}"
+            if hasattr(port, 'vid') and port.vid is not None and hasattr(port, 'pid') and port.pid is not None:
+                port_info += f" (VID:{port.vid:04x} PID:{port.pid:04x})"
+                available_ports.append(port_info)
+                
+                if port.vid == MOTOR_CONTROLLER_USB['vendor_id'] and port.pid == MOTOR_CONTROLLER_USB['product_id']:
+                    logger.info(f"Found motor controller at {port.device}")
+                    return port.device
+            else:
+                available_ports.append(port_info)
+        
+        # If we reach here, no matching device was found
+        logger.warning(f"Motor controller not found. Available ports: {available_ports}")
         return None
 
     # Setup methods (private)
@@ -316,31 +337,59 @@ class MotorController:
         """Write to register with continuous retry until successful."""
         with self._lock:
             attempt = 1
-            while True:
+            while attempt <= 3:  # Limit to 3 attempts
                 try:
                     self.drive.write_register(address, value, functioncode=functioncode)
                     time.sleep(0.01)
                     return
                 except Exception as e:
-                    print(f"Write attempt {attempt} failed: {str(e)}")
-                    print(f"Retrying write to motor {self.slave_address} in 1 second...")
+                    error_msg = str(e)
+                    logger.error(f"Write attempt {attempt}/3 failed: {error_msg}")
+                    
+                    # Check if this is a USB communication error
+                    if "No such file or directory" in error_msg or "No such device" in error_msg or "Input/output error" in error_msg or "could not open port" in error_msg:
+                        logger.info(f"USB communication error detected, resetting USB via pin {self.reset_pin}")
+                        reset_usb_connection(self.reset_pin)
+                        # Allow additional time for complete device enumeration after reset
+                        logger.info("Waiting additional time for device enumeration after reset...")
+                        time.sleep(2)
+                    
+                    # Always try to reconnect regardless of error type
                     attempt += 1
-                    self._reconnect()
+                    if attempt <= 3:
+                        logger.info(f"Retrying write to motor {self.slave_address}")
+                        self._reconnect()
+                    else:
+                        raise  # Re-raise the last exception after all attempts
 
     def _read_register(self, address, functioncode=3):
         """Read from register with continuous retry until successful."""
         with self._lock:
             attempt = 1
-            while True:
+            while attempt <= 3:  # Limit to 3 attempts
                 try:
                     response = self.drive.read_register(address, functioncode=functioncode)
                     time.sleep(0.01)
                     return response
                 except Exception as e:
-                    print(f"Read attempt {attempt} failed: {str(e)}")
-                    print(f"Retrying read from motor {self.slave_address} in 1 second...")
+                    error_msg = str(e)
+                    logger.error(f"Read attempt {attempt}/3 failed: {error_msg}")
+                    
+                    # Check if this is a USB communication error
+                    if "No such file or directory" in error_msg or "No such device" in error_msg or "Input/output error" in error_msg or "could not open port" in error_msg:
+                        logger.info(f"USB communication error detected, resetting USB via pin {self.reset_pin}")
+                        reset_usb_connection(self.reset_pin)
+                        # Allow additional time for complete device enumeration after reset
+                        logger.info("Waiting additional time for device enumeration after reset...")
+                        time.sleep(2)
+                    
+                    # Always try to reconnect regardless of error type
                     attempt += 1
-                    self._reconnect()
+                    if attempt <= 3:
+                        logger.info(f"Retrying read from motor {self.slave_address}")
+                        self._reconnect()
+                    else:
+                        raise  # Re-raise the last exception after all attempts
 
     # Private methods for internal operations
     def _check_alarm(self):
